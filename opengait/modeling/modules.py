@@ -85,6 +85,80 @@ class BasicConv2d(nn.Module):
         return x
 
 
+class TemporalSpectralAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        groups=1,
+        bottleneck_ratio=0.25,
+        fusion='residual',
+        spectral_mode='amplitude',
+    ):
+        super().__init__()
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        if fusion not in ['residual', 'gated_residual']:
+            raise ValueError("fusion must be 'residual' or 'gated_residual'")
+        if spectral_mode not in ['amplitude', 'amplitude_phase']:
+            raise ValueError("spectral_mode must be 'amplitude' or 'amplitude_phase'")
+
+        self.channels = channels
+        self.groups = groups
+        self.group_channels = channels // groups
+        self.fusion = fusion
+        self.spectral_mode = spectral_mode
+
+        hidden_dim = max(int(self.group_channels * bottleneck_ratio), 1)
+        self.norm = nn.LayerNorm(channels)
+        self.amp_mlp = nn.Sequential(
+            nn.Linear(self.group_channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.group_channels),
+        )
+        if spectral_mode == 'amplitude_phase':
+            self.phase_mlp = nn.Sequential(
+                nn.Linear(self.group_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels),
+            )
+        else:
+            self.phase_mlp = None
+        self.res_scale = nn.Parameter(torch.zeros(1))
+        self.fusion_gate = nn.Linear(channels, channels) if fusion == 'gated_residual' else None
+
+    def forward(self, x):
+        """
+            x: [n, c, s, h, w]
+        """
+        n, c, s = x.size()[:3]
+        desc = x.mean(dim=(-1, -2)).transpose(1, 2).contiguous()  # [n, s, c]
+        desc = self.norm(desc)
+
+        freq = torch.fft.rfft(desc, dim=1, norm='ortho')
+        amp = torch.abs(freq)
+        phase = torch.angle(freq)
+
+        freq_bins = amp.size(1)
+        amp_grouped = amp.view(n, freq_bins, self.groups, self.group_channels)
+        amp_gate = torch.tanh(self.amp_mlp(amp_grouped)).view(n, freq_bins, c)
+        amp = amp * (1.0 + amp_gate)
+
+        if self.phase_mlp is not None:
+            phase_grouped = phase.view(n, freq_bins, self.groups, self.group_channels)
+            phase_delta = 0.1 * torch.tanh(self.phase_mlp(phase_grouped)).view(n, freq_bins, c)
+            phase = phase + phase_delta
+
+        freq = torch.polar(amp, phase)
+        enhanced = torch.fft.irfft(freq, n=s, dim=1, norm='ortho')
+        delta = enhanced - desc
+
+        if self.fusion_gate is not None:
+            delta = delta * torch.sigmoid(self.fusion_gate(desc))
+
+        delta = delta.transpose(1, 2).unsqueeze(-1).unsqueeze(-1).contiguous()
+        return x + self.res_scale * delta
+
+
 class SeparateFCs(nn.Module):
     def __init__(self, parts_num, in_channels, out_channels, norm=False):
         super(SeparateFCs, self).__init__()

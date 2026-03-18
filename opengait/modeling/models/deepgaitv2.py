@@ -7,7 +7,7 @@ import os.path as osp
 import matplotlib.pyplot as plt
 
 from ..base_model import BaseModel
-from ..modules import SetBlockWrapper, HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, conv1x1, conv3x3, BasicBlock2D, BasicBlockP3D, BasicBlock3D
+from ..modules import SetBlockWrapper, HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, TemporalSpectralAdapter, conv1x1, conv3x3, BasicBlock2D, BasicBlockP3D, BasicBlock3D
 
 from einops import rearrange
 
@@ -66,6 +66,16 @@ class DeepGaitV2(BaseModel):
 
         self.TP = PackSequenceWrapper(torch.max)
         self.HPP = HorizontalPoolingPyramid(bin_num=[16])
+        adapter_cfg = model_cfg.get('TemporalSpectralAdapter', {})
+        if adapter_cfg.get('enable', False):
+            adapter_cfg = dict(adapter_cfg)
+            adapter_cfg.pop('enable')
+            self.temporal_adapter = TemporalSpectralAdapter(
+                channels=channels[3],
+                **adapter_cfg,
+            )
+        else:
+            self.temporal_adapter = None
 
     def make_layer(self, block, planes, stride, blocks_num, mode='2d'):
 
@@ -106,6 +116,8 @@ class DeepGaitV2(BaseModel):
         out2 = self.layer2(out1)
         out3 = self.layer3(out2)
         out4 = self.layer4(out3) # [n, c, s, h, w]
+        if self.temporal_adapter is not None:
+            out4 = self.temporal_adapter(out4)
 
         # Temporal Pooling, TP
         outs = self.TP(out4, seqL, options={"dim": 2})[0]  # [n, c, h, w]

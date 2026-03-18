@@ -3,7 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from ..base_model import BaseModel
-from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, SetBlockWrapper, conv3x3, conv1x1, BasicBlock2D, BasicBlockP3D
+from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, SetBlockWrapper, TemporalSpectralAdapter, conv3x3, conv1x1, BasicBlock2D, BasicBlockP3D
 
 from einops import rearrange
 
@@ -42,6 +42,16 @@ class SkeletonGaitPP(BaseModel):
 
        self.TP = PackSequenceWrapper(torch.max)
        self.HPP = HorizontalPoolingPyramid(bin_num=[16])
+       adapter_cfg = model_cfg.get('TemporalSpectralAdapter', {})
+       if adapter_cfg.get('enable', False):
+           adapter_cfg = dict(adapter_cfg)
+           adapter_cfg.pop('enable')
+           self.temporal_adapter = TemporalSpectralAdapter(
+               channels=256 * C,
+               **adapter_cfg,
+           )
+       else:
+           self.temporal_adapter = None
 
    def make_layer(self, block, planes, stride, blocks_num, mode='2d'):
 
@@ -102,6 +112,8 @@ class SkeletonGaitPP(BaseModel):
        out2 = self.layer2(out1)
        out3 = self.layer3(out2)
        out4 = self.layer4(out3) # [n, c, s, h, w]
+       if self.temporal_adapter is not None:
+           out4 = self.temporal_adapter(out4)
 
        # Temporal Pooling, TP
        outs = self.TP(out4, seqL, options={"dim": 2})[0]  # [n, c, h, w]
