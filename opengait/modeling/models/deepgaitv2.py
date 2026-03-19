@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 
 import os
 import numpy as np
@@ -8,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from ..base_model import BaseModel
 from ..modules import SetBlockWrapper, HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, TemporalSpectralAdapter, conv1x1, conv3x3, BasicBlock2D, BasicBlockP3D, BasicBlock3D
+from utils import get_valid_args, get_attr_from
 
 from einops import rearrange
 
@@ -76,6 +78,59 @@ class DeepGaitV2(BaseModel):
             )
         else:
             self.temporal_adapter = None
+        self.finetune_cfg = model_cfg.get('Finetune', {})
+        self.configure_finetune()
+
+    def configure_finetune(self):
+        mode = self.finetune_cfg.get('mode', 'full')
+        if mode == 'full':
+            for param in self.parameters():
+                param.requires_grad = True
+        elif mode == 'adapter_head':
+            for param in self.parameters():
+                param.requires_grad = False
+            if self.temporal_adapter is not None:
+                for param in self.temporal_adapter.parameters():
+                    param.requires_grad = True
+            for module in [self.FCs, self.BNNecks]:
+                for param in module.parameters():
+                    param.requires_grad = True
+        else:
+            raise ValueError("Unsupported Finetune.mode: {}".format(mode))
+
+    def get_optimizer(self, optimizer_cfg):
+        self.msg_mgr.log_info(optimizer_cfg)
+        optimizer_cls = get_attr_from([optim], optimizer_cfg['solver'])
+        valid_arg = get_valid_args(optimizer_cls, optimizer_cfg, ['solver'])
+
+        finetune_cfg = self.finetune_cfg if hasattr(self, 'finetune_cfg') else {}
+        if not finetune_cfg:
+            return optimizer_cls(
+                filter(lambda p: p.requires_grad, self.parameters()), **valid_arg)
+
+        backbone_lr = optimizer_cfg.get('backbone_lr', optimizer_cfg['lr'])
+        head_lr = optimizer_cfg.get('head_lr', optimizer_cfg['lr'])
+        adapter_lr = optimizer_cfg.get('adapter_lr', optimizer_cfg['lr'])
+        weight_decay = optimizer_cfg.get('weight_decay', 0.0)
+        mode = finetune_cfg.get('mode', 'full')
+
+        param_groups = []
+        backbone_modules = [self.layer0, self.layer1, self.layer2, self.layer3, self.layer4]
+        backbone_params = [p for module in backbone_modules for p in module.parameters() if p.requires_grad]
+        head_params = [p for module in [self.FCs, self.BNNecks] for p in module.parameters() if p.requires_grad]
+        adapter_params = list(self.temporal_adapter.parameters()) if self.temporal_adapter is not None else []
+        adapter_params = [p for p in adapter_params if p.requires_grad]
+
+        if mode == 'full' and backbone_params:
+            param_groups.append({'params': backbone_params, 'lr': backbone_lr, 'weight_decay': weight_decay})
+        if head_params:
+            param_groups.append({'params': head_params, 'lr': head_lr, 'weight_decay': weight_decay})
+        if adapter_params:
+            param_groups.append({'params': adapter_params, 'lr': adapter_lr, 'weight_decay': weight_decay})
+
+        if not param_groups:
+            raise ValueError("No trainable parameters found for DeepGaitV2 finetuning.")
+        return optimizer_cls(param_groups, **valid_arg)
 
     def make_layer(self, block, planes, stride, blocks_num, mode='2d'):
 

@@ -1,0 +1,109 @@
+data_cfg:
+  dataset_name: Gait3D
+  dataset_root: gait_dataset/gait3d/Gait3D-sils-64-44-pkl
+  dataset_partition: ./datasets/Gait3D/Gait3D.json
+  num_workers: 1
+  remove_no_gallery: false
+  test_dataset_name: Gait3D
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: false
+  restore_hint: 20000
+  save_name: DeepGaitV2_TSA_Gait3D_FT_FULL
+  eval_func: evaluate_Gait3D
+  sampler:
+    batch_shuffle: false
+    batch_size: 8
+    sample_type: all_ordered
+    frames_all_limit: 720
+  metric: euc
+  transform:
+    - type: BaseSilCuttingTransform
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: DeepGaitV2
+  Finetune:
+    mode: full
+  TemporalSpectralAdapter:
+    enable: true
+    groups: 1
+    bottleneck_ratio: 0.25
+    fusion: residual
+    spectral_mode: amplitude
+  Backbone:
+    in_channels: 1
+    mode: p3d
+    layers:
+      - 1
+      - 4
+      - 4
+      - 1
+    channels:
+      - 64
+      - 128
+      - 256
+      - 512
+  SeparateBNNecks:
+    class_num: 3000
+
+optimizer_cfg:
+  lr: 0.001
+  backbone_lr: 0.0005
+  head_lr: 0.001
+  adapter_lr: 0.001
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones:
+    - 10000
+    - 16000
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: false
+  enable_float16: true
+  fix_BN: false
+  with_test: true
+  log_iter: 100
+  restore_ckpt_strict: false
+  optimizer_reset: true
+  scheduler_reset: true
+  restore_hint: pretrained_weights/Gait3D/DeepGaitV2/DeepGaitV2/checkpoints/DeepGaitV2-60000.pt
+  save_iter: 5000
+  save_name: DeepGaitV2_TSA_Gait3D_FT_FULL
+  sync_BN: true
+  total_iter: 20000
+  sampler:
+    batch_shuffle: true
+    batch_size:
+      - 32
+      - 4
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    sample_type: fixed_ordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomPerspective
+          prob: 0.2
+        - type: BaseSilCuttingTransform
+        - type: RandomHorizontalFlip
+          prob: 0.2
+        - type: RandomRotate
+          prob: 0.2

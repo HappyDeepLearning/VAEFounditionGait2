@@ -2,9 +2,9 @@
 # # Baseline
 # CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/baseline/baseline.yaml --phase train
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch \
-        --nproc_per_node=8 --master_port=9382  opengait/main.py \
-        --cfgs ./configs/deepgaitv2/DeepGaitV2_gait3d_tsa_ft_full.yaml \
+CUDA_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 python -m torch.distributed.launch \
+        --nproc_per_node=8 --master_port=9381  opengait/main.py \
+        --cfgs ./configs/deepgaitv2/DeepGaitV2_gait3d_tsa_ft_head.yaml \
         --phase train --log_to_file
 
 # # GaitSet
