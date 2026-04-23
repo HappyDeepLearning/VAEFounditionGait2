@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 import torch.nn as nn
@@ -93,6 +94,14 @@ class TemporalSpectralAdapter(nn.Module):
         bottleneck_ratio=0.25,
         fusion='residual',
         spectral_mode='amplitude',
+        local_kernel_sizes=(3, 5),
+        init_scale=0.1,
+        use_spatial_gate=True,
+        part_bins=4,
+        low_freq_ratio=0.25,
+        dynamic_only=True,
+        branch_sources=('identity', 'local', 'dynamic', 'dynamic_gap', 'part'),
+        **kwargs,
     ):
         super().__init__()
         if channels % groups != 0:
@@ -101,16 +110,52 @@ class TemporalSpectralAdapter(nn.Module):
             raise ValueError("fusion must be 'residual' or 'gated_residual'")
         if spectral_mode not in ['amplitude', 'amplitude_phase']:
             raise ValueError("spectral_mode must be 'amplitude' or 'amplitude_phase'")
+        valid_sources = {'identity', 'local', 'dynamic', 'dynamic_gap', 'part'}
+        if any(source not in valid_sources for source in branch_sources):
+            raise ValueError("Unsupported branch source in {}".format(branch_sources))
+        if 'part' in branch_sources and int(part_bins) <= 0:
+            raise ValueError("part source requires part_bins > 0")
+        if kwargs:
+            # Keep config loading backward compatible while making the active module branch-only.
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("TemporalSpectralAdapter ignores unused config keys: {}".format(ignored))
 
         self.channels = channels
         self.groups = groups
         self.group_channels = channels // groups
         self.fusion = fusion
         self.spectral_mode = spectral_mode
+        self.use_spatial_gate = use_spatial_gate
+        self.part_bins = int(part_bins)
+        self.low_freq_ratio = float(low_freq_ratio)
+        self.dynamic_only = dynamic_only
+        self.branch_sources = list(branch_sources)
 
         hidden_dim = max(int(self.group_channels * bottleneck_ratio), 1)
         self.norm = nn.LayerNorm(channels)
+        kernel_sizes = local_kernel_sizes if is_list_or_tuple(local_kernel_sizes) else [local_kernel_sizes]
+        self.local_branches = nn.ModuleList([
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=int(kernel_size),
+                padding=int(kernel_size) // 2,
+                groups=groups,
+                bias=False,
+            )
+            for kernel_size in kernel_sizes
+        ])
+        self.local_fuse = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
         self.amp_mlp = nn.Sequential(
+            nn.Linear(self.group_channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.group_channels),
+        )
+        self.low_amp_mlp = nn.Sequential(
             nn.Linear(self.group_channels, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.group_channels),
@@ -121,42 +166,1143 @@ class TemporalSpectralAdapter(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.group_channels),
             )
+            self.low_phase_mlp = nn.Sequential(
+                nn.Linear(self.group_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels),
+            )
         else:
             self.phase_mlp = None
-        self.res_scale = nn.Parameter(torch.zeros(1))
-        self.fusion_gate = nn.Linear(channels, channels) if fusion == 'gated_residual' else None
+            self.low_phase_mlp = None
+        self.spectral_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.identity_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        if self.part_bins > 0:
+            self.part_norm = nn.LayerNorm(channels)
+            self.part_amp_mlp = nn.Sequential(
+                nn.Linear(self.group_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels),
+            )
+            self.part_proj = nn.Sequential(
+                nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+                nn.BatchNorm1d(channels),
+                nn.GELU(),
+            )
+        else:
+            self.part_norm = None
+            self.part_amp_mlp = None
+            self.part_proj = None
+        self.branch_summary = nn.Sequential(
+            nn.Linear(channels, max(channels // 4, 32)),
+            nn.GELU(),
+            nn.Linear(max(channels // 4, 32), len(self.branch_sources)),
+        )
+        self.branch_source_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.branch_out_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1), float(init_scale)))
+        self.fusion_gate = nn.Conv1d(channels, channels, kernel_size=1, bias=True) \
+            if fusion == 'gated_residual' else None
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid(),
+        ) if use_spatial_gate else None
+        self.part_spatial_gate = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.Sigmoid(),
+        ) if self.part_bins > 0 else None
+
+    def _modulate_spectrum(self, amp, phase, amp_mlp, phase_mlp=None, gate_scale=0.25):
+        n, freq_bins, c = amp.shape
+        amp_grouped = amp.view(n, freq_bins, self.groups, self.group_channels)
+        amp_gate = gate_scale * torch.tanh(amp_mlp(amp_grouped)).view(n, freq_bins, c)
+        amp = amp * (1.0 + amp_gate)
+        if phase_mlp is not None:
+            phase_grouped = phase.view(n, freq_bins, self.groups, self.group_channels)
+            phase = phase + gate_scale * torch.tanh(phase_mlp(phase_grouped)).view(n, freq_bins, c)
+        return amp, phase
+
+    def _split_reconstruct(self, desc_tokens, amp_mlp_high, amp_mlp_low, phase_mlp_high=None, phase_mlp_low=None):
+        n, s, c = desc_tokens.shape
+        freq = torch.fft.rfft(desc_tokens, dim=1, norm='ortho')
+        amp = torch.abs(freq)
+        phase = torch.angle(freq)
+        freq_bins = amp.size(1)
+        low_bins = min(max(int(round(freq_bins * self.low_freq_ratio)), 1), freq_bins)
+
+        low_amp = amp[:, :low_bins]
+        low_phase = phase[:, :low_bins]
+        low_amp, low_phase = self._modulate_spectrum(
+            low_amp, low_phase, amp_mlp_low, phase_mlp_low, gate_scale=0.15)
+
+        high_amp = amp[:, low_bins:]
+        high_phase = phase[:, low_bins:]
+        if high_amp.numel() > 0:
+            high_amp, high_phase = self._modulate_spectrum(
+                high_amp, high_phase, amp_mlp_high, phase_mlp_high, gate_scale=0.30)
+
+        identity_freq = torch.zeros_like(freq)
+        identity_freq[:, :low_bins] = torch.polar(low_amp, low_phase)
+        dynamic_freq = torch.zeros_like(freq)
+        if high_amp.numel() > 0:
+            dynamic_freq[:, low_bins:] = torch.polar(high_amp, high_phase)
+        elif not self.dynamic_only:
+            dynamic_freq[:, :low_bins] = identity_freq[:, :low_bins]
+
+        identity = torch.fft.irfft(identity_freq, n=s, dim=1, norm='ortho')
+        dynamic = torch.fft.irfft(dynamic_freq, n=s, dim=1, norm='ortho')
+        return dynamic, identity
+
+    def _compute_local(self, desc_norm):
+        local = 0.0
+        for branch in self.local_branches:
+            local = local + branch(desc_norm)
+        return self.local_fuse(local / len(self.local_branches))
+
+    def _compute_part_context(self, x):
+        n, c, s = x.size()[:3]
+        part_context = torch.zeros_like(x.mean(dim=(-1, -2)))
+        part_spatial_gate = None
+        if self.part_bins <= 0:
+            return part_context, part_spatial_gate
+
+        part_desc = x.mean(dim=-1)
+        part_desc = part_desc.permute(0, 2, 1, 3).reshape(n * s, c, x.size(-2))
+        part_desc = F.adaptive_avg_pool1d(part_desc, self.part_bins)
+        part_desc = part_desc.view(n, s, c, self.part_bins).permute(0, 3, 1, 2).contiguous()
+        part_tokens = self.part_norm(part_desc).view(n * self.part_bins, s, c)
+        part_dynamic, _ = self._split_reconstruct(
+            part_tokens,
+            self.part_amp_mlp,
+            self.low_amp_mlp,
+            None,
+            None,
+        )
+        part_dynamic = part_dynamic.view(n, self.part_bins, s, c).permute(0, 3, 2, 1).contiguous()
+        part_context = self.part_proj(part_dynamic.mean(dim=-1))
+        if self.part_spatial_gate is not None:
+            part_gate = self.part_spatial_gate(part_dynamic.mean(dim=2))
+            part_gate = F.interpolate(part_gate, size=x.size(-2), mode='linear', align_corners=False)
+            part_spatial_gate = part_gate.unsqueeze(2).unsqueeze(-1)
+        return part_context, part_spatial_gate
+
+    def _compute_delta(self, x, desc_norm, delta_1d, part_spatial_gate=None):
+        delta = delta_1d
+        if self.fusion_gate is not None:
+            delta = delta * torch.sigmoid(self.fusion_gate(desc_norm))
+        delta = self.res_scale * delta
+        delta = delta.unsqueeze(-1).unsqueeze(-1)
+        if self.spatial_gate is not None:
+            spatial_gate = self.spatial_gate(x.mean(dim=2)).unsqueeze(2)
+            delta = delta * spatial_gate
+        if part_spatial_gate is not None:
+            delta = delta * part_spatial_gate
+        return delta
+
+    def _forward_branch_attention(self, x, desc_norm, global_tokens, local):
+        dynamic, identity = self._split_reconstruct(
+            global_tokens,
+            self.amp_mlp,
+            self.low_amp_mlp,
+            self.phase_mlp,
+            self.low_phase_mlp,
+        )
+        dynamic = self.spectral_proj(dynamic.transpose(1, 2).contiguous())
+        identity = self.identity_proj(identity.transpose(1, 2).contiguous())
+        part_context, part_spatial_gate = self._compute_part_context(x)
+        source_map = {
+            'identity': identity,
+            'local': local,
+            'dynamic': dynamic,
+            'dynamic_gap': self.branch_source_proj(dynamic - identity),
+            'part': part_context,
+        }
+        branch_stack = torch.stack([source_map[name] for name in self.branch_sources], dim=1)
+        branch_query = desc_norm.mean(dim=-1)
+        branch_weights = torch.softmax(self.branch_summary(branch_query), dim=-1)
+        delta = (branch_stack * branch_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        delta = self.branch_out_proj(delta)
+        return self._compute_delta(x, desc_norm, delta, part_spatial_gate)
 
     def forward(self, x):
         """
             x: [n, c, s, h, w]
         """
         n, c, s = x.size()[:3]
-        desc = x.mean(dim=(-1, -2)).transpose(1, 2).contiguous()  # [n, s, c]
-        desc = self.norm(desc)
+        desc = x.mean(dim=(-1, -2))  # [n, c, s]
+        desc_norm = self.norm(desc.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+        local = self._compute_local(desc_norm)
 
-        freq = torch.fft.rfft(desc, dim=1, norm='ortho')
+        global_tokens = desc_norm.transpose(1, 2).contiguous()
+        delta = self._forward_branch_attention(x, desc_norm, global_tokens, local)
+        return x + delta
+
+
+class AdaptiveHarmonicResonanceAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        groups=1,
+        bottleneck_ratio=0.25,
+        fusion='gated_residual',
+        spectral_mode='amplitude_phase',
+        local_kernel_sizes=(3, 5),
+        init_scale=0.05,
+        use_spatial_gate=True,
+        low_freq_ratio=0.20,
+        dynamic_only=True,
+        harmonic_orders=(1, 2, 3),
+        harmonic_sigma=1.5,
+    ):
+        super().__init__()
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        if fusion not in ['residual', 'gated_residual']:
+            raise ValueError("fusion must be 'residual' or 'gated_residual'")
+        if spectral_mode not in ['amplitude', 'amplitude_phase']:
+            raise ValueError("spectral_mode must be 'amplitude' or 'amplitude_phase'")
+        if len(harmonic_orders) == 0:
+            raise ValueError("harmonic_orders must not be empty")
+
+        self.channels = channels
+        self.groups = groups
+        self.group_channels = channels // groups
+        self.fusion = fusion
+        self.spectral_mode = spectral_mode
+        self.use_spatial_gate = use_spatial_gate
+        self.low_freq_ratio = float(low_freq_ratio)
+        self.dynamic_only = dynamic_only
+        self.harmonic_sigma = float(harmonic_sigma)
+
+        hidden_dim = max(int(self.group_channels * bottleneck_ratio), 1)
+        self.norm = nn.LayerNorm(channels)
+        kernel_sizes = local_kernel_sizes if is_list_or_tuple(local_kernel_sizes) else [local_kernel_sizes]
+        self.local_branches = nn.ModuleList([
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=int(kernel_size),
+                padding=int(kernel_size) // 2,
+                groups=groups,
+                bias=False,
+            )
+            for kernel_size in kernel_sizes
+        ])
+        self.local_fuse = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.harmonic_amp_mlp = nn.Sequential(
+            nn.Linear(self.group_channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.group_channels),
+        )
+        self.low_amp_mlp = nn.Sequential(
+            nn.Linear(self.group_channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.group_channels),
+        )
+        if spectral_mode == 'amplitude_phase':
+            self.harmonic_phase_mlp = nn.Sequential(
+                nn.Linear(self.group_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels),
+            )
+            self.low_phase_mlp = nn.Sequential(
+                nn.Linear(self.group_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels),
+            )
+        else:
+            self.harmonic_phase_mlp = None
+            self.low_phase_mlp = None
+        self.register_buffer(
+            'harmonic_orders',
+            torch.tensor(list(harmonic_orders), dtype=torch.float32),
+            persistent=False,
+        )
+        self.order_weight_mlp = nn.Sequential(
+            nn.Linear(channels, max(channels // 4, 32)),
+            nn.GELU(),
+            nn.Linear(max(channels // 4, 32), len(harmonic_orders)),
+        )
+        self.identity_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.harmonic_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.harmonic_gap_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.mix = nn.Sequential(
+            nn.Conv1d(channels * 4, channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+        )
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1), float(init_scale)))
+        self.fusion_gate = nn.Conv1d(channels, channels, kernel_size=1, bias=True) \
+            if fusion == 'gated_residual' else None
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid(),
+        ) if use_spatial_gate else None
+
+    def _modulate_spectrum(self, amp, phase, amp_mlp, phase_mlp=None, gate_scale=0.25):
+        n, freq_bins, c = amp.shape
+        amp_grouped = amp.view(n, freq_bins, self.groups, self.group_channels)
+        amp_gate = gate_scale * torch.tanh(amp_mlp(amp_grouped)).view(n, freq_bins, c)
+        amp = amp * (1.0 + amp_gate)
+        if phase_mlp is not None:
+            phase_grouped = phase.view(n, freq_bins, self.groups, self.group_channels)
+            phase = phase + gate_scale * torch.tanh(phase_mlp(phase_grouped)).view(n, freq_bins, c)
+        return amp, phase
+
+    def _compute_local(self, desc_norm):
+        local = 0.0
+        for branch in self.local_branches:
+            local = local + branch(desc_norm)
+        return self.local_fuse(local / len(self.local_branches))
+
+    def _build_harmonic_mask(self, amp, desc_norm, low_bins):
+        n, freq_bins = amp.size(0), amp.size(1)
+        energy = amp.mean(dim=-1)
+        high_energy = energy[:, low_bins:]
+        if high_energy.numel() == 0:
+            return energy.new_zeros(n, freq_bins)
+
+        peak_idx = high_energy.argmax(dim=-1) + low_bins
+        order_weights = torch.softmax(self.order_weight_mlp(desc_norm.mean(dim=-1)), dim=-1)
+        centers = peak_idx.float().unsqueeze(1) * self.harmonic_orders.unsqueeze(0)
+        centers = centers.clamp(max=freq_bins - 1)
+        freq_axis = torch.arange(freq_bins, device=amp.device, dtype=amp.dtype).view(1, 1, -1)
+        sigma = max(self.harmonic_sigma, 1e-3)
+        masks = torch.exp(-0.5 * ((freq_axis - centers.unsqueeze(-1)) / sigma) ** 2)
+        harmonic_mask = (masks * order_weights.unsqueeze(-1)).sum(dim=1)
+        harmonic_mask[:, :low_bins] = 0.0
+        return harmonic_mask
+
+    def _compute_delta(self, x, desc_norm, delta_1d):
+        delta = delta_1d
+        if self.fusion_gate is not None:
+            delta = delta * torch.sigmoid(self.fusion_gate(desc_norm))
+        delta = self.res_scale * delta
+        delta = delta.unsqueeze(-1).unsqueeze(-1)
+        if self.spatial_gate is not None:
+            spatial_gate = self.spatial_gate(x.mean(dim=2)).unsqueeze(2)
+            delta = delta * spatial_gate
+        return delta
+
+    def forward(self, x):
+        n, c, s = x.size()[:3]
+        desc = x.mean(dim=(-1, -2))
+        desc_norm = self.norm(desc.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+        local = self._compute_local(desc_norm)
+
+        tokens = desc_norm.transpose(1, 2).contiguous()
+        freq = torch.fft.rfft(tokens, dim=1, norm='ortho')
         amp = torch.abs(freq)
         phase = torch.angle(freq)
-
         freq_bins = amp.size(1)
-        amp_grouped = amp.view(n, freq_bins, self.groups, self.group_channels)
-        amp_gate = torch.tanh(self.amp_mlp(amp_grouped)).view(n, freq_bins, c)
-        amp = amp * (1.0 + amp_gate)
+        low_bins = min(max(int(round(freq_bins * self.low_freq_ratio)), 1), freq_bins)
 
-        if self.phase_mlp is not None:
-            phase_grouped = phase.view(n, freq_bins, self.groups, self.group_channels)
-            phase_delta = 0.1 * torch.tanh(self.phase_mlp(phase_grouped)).view(n, freq_bins, c)
-            phase = phase + phase_delta
+        low_amp = amp[:, :low_bins]
+        low_phase = phase[:, :low_bins]
+        low_amp, low_phase = self._modulate_spectrum(
+            low_amp, low_phase, self.low_amp_mlp, self.low_phase_mlp, gate_scale=0.12)
 
-        freq = torch.polar(amp, phase)
-        enhanced = torch.fft.irfft(freq, n=s, dim=1, norm='ortho')
-        delta = enhanced - desc
+        harmonic_amp = amp.clone()
+        harmonic_phase = phase.clone()
+        harmonic_mask = self._build_harmonic_mask(amp, desc_norm, low_bins).unsqueeze(-1)
+        harmonic_amp, harmonic_phase = self._modulate_spectrum(
+            harmonic_amp, harmonic_phase, self.harmonic_amp_mlp, self.harmonic_phase_mlp, gate_scale=0.25)
+        harmonic_amp = harmonic_amp * harmonic_mask
+        harmonic_phase = phase + (harmonic_phase - phase) * harmonic_mask
 
+        identity_freq = torch.zeros_like(freq)
+        identity_freq[:, :low_bins] = torch.polar(low_amp, low_phase)
+        harmonic_freq = torch.zeros_like(freq)
+        if harmonic_amp[:, low_bins:].numel() > 0:
+            harmonic_freq[:, low_bins:] = torch.polar(harmonic_amp[:, low_bins:], harmonic_phase[:, low_bins:])
+        elif not self.dynamic_only:
+            harmonic_freq[:, :low_bins] = identity_freq[:, :low_bins]
+
+        identity = torch.fft.irfft(identity_freq, n=s, dim=1, norm='ortho').transpose(1, 2).contiguous()
+        harmonic = torch.fft.irfft(harmonic_freq, n=s, dim=1, norm='ortho').transpose(1, 2).contiguous()
+        identity = self.identity_proj(identity)
+        harmonic = self.harmonic_proj(harmonic)
+        harmonic_gap = self.harmonic_gap_proj(harmonic - identity)
+        delta = self.mix(torch.cat([desc_norm, local, harmonic, harmonic_gap], dim=1))
+        delta = self._compute_delta(x, desc_norm, delta)
+        return x + delta
+
+
+class ComplexHarmonicFilterBankAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        groups=1,
+        bottleneck_ratio=0.25,
+        fusion='gated_residual',
+        local_kernel_sizes=(3, 5),
+        init_scale=0.05,
+        use_spatial_gate=True,
+        low_freq_ratio=0.20,
+        harmonic_orders=(1, 2, 3),
+        harmonic_sigma=1.5,
+        bank_temperature=1.0,
+        **kwargs,
+    ):
+        super().__init__()
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        if fusion not in ['residual', 'gated_residual']:
+            raise ValueError("fusion must be 'residual' or 'gated_residual'")
+        if len(harmonic_orders) == 0:
+            raise ValueError("harmonic_orders must not be empty")
+        if kwargs:
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("ComplexHarmonicFilterBankAdapter ignores unused config keys: {}".format(ignored))
+
+        self.channels = channels
+        self.groups = groups
+        self.group_channels = channels // groups
+        self.fusion = fusion
+        self.use_spatial_gate = use_spatial_gate
+        self.low_freq_ratio = float(low_freq_ratio)
+        self.harmonic_sigma = float(harmonic_sigma)
+        self.bank_temperature = float(bank_temperature)
+
+        hidden_dim = max(int(self.group_channels * bottleneck_ratio), 1)
+        self.norm = nn.LayerNorm(channels)
+        kernel_sizes = local_kernel_sizes if is_list_or_tuple(local_kernel_sizes) else [local_kernel_sizes]
+        self.local_branches = nn.ModuleList([
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=int(kernel_size),
+                padding=int(kernel_size) // 2,
+                groups=groups,
+                bias=False,
+            )
+            for kernel_size in kernel_sizes
+        ])
+        self.local_fuse = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.register_buffer(
+            'harmonic_orders',
+            torch.tensor(list(harmonic_orders), dtype=torch.float32),
+            persistent=False,
+        )
+        self.order_weight_mlp = nn.Sequential(
+            nn.Linear(channels, max(channels // 4, 32)),
+            nn.GELU(),
+            nn.Linear(max(channels // 4, 32), len(harmonic_orders)),
+        )
+
+        # Three spectral banks: low-frequency identity-like, harmonic band, residual band.
+        self.bank_names = ['low', 'harmonic', 'residual']
+        self.bank_scales = (0.10, 0.20, 0.15)
+        self.bank_gate_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.group_channels * 5, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.group_channels * 2),
+            )
+            for _ in self.bank_names
+        ])
+        self.bank_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+                nn.BatchNorm1d(channels),
+                nn.GELU(),
+            )
+            for _ in self.bank_names
+        ])
+        self.router = nn.Sequential(
+            nn.Linear(channels + 4, max(channels // 4, 32)),
+            nn.GELU(),
+            nn.Linear(max(channels // 4, 32), len(self.bank_names)),
+        )
+        self.bank_fuse = nn.Sequential(
+            nn.Conv1d(channels * 4, channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+        )
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1), float(init_scale)))
+        self.fusion_gate = nn.Conv1d(channels, channels, kernel_size=1, bias=True) \
+            if fusion == 'gated_residual' else None
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid(),
+        ) if use_spatial_gate else None
+        self.delta_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+
+    def _compute_local(self, desc_norm):
+        local = 0.0
+        for branch in self.local_branches:
+            local = local + branch(desc_norm)
+        return self.local_fuse(local / len(self.local_branches))
+
+    def _spectral_statistics(self, amp, low_bins):
+        energy = amp.mean(dim=-1)  # [n, freq]
+        denom = energy.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        prob = energy / denom
+        entropy = -(prob * (prob.clamp_min(1e-6)).log()).sum(dim=1, keepdim=True)
+        entropy = entropy / math.log(float(max(energy.size(1), 2)))
+
+        if energy.size(1) > low_bins:
+            high_energy = energy[:, low_bins:]
+            peak_idx = high_energy.argmax(dim=-1) + low_bins
+        else:
+            peak_idx = energy.argmax(dim=-1)
+        peak_val = energy.gather(1, peak_idx.unsqueeze(-1)).squeeze(-1)
+
+        mean_energy = energy.mean(dim=1, keepdim=True)
+        std_energy = energy.std(dim=1, keepdim=True, unbiased=False)
+        peak_contrast = (peak_val.unsqueeze(-1) - mean_energy) / (std_energy + 1e-6)
+        return torch.cat([mean_energy, std_energy, entropy, peak_contrast], dim=-1), peak_idx
+
+    def _build_bank_masks(self, amp, desc_norm, low_bins):
+        n, freq_bins = amp.size(0), amp.size(1)
+        bank_device = amp.device
+        bank_dtype = amp.dtype
+        low_mask = torch.zeros(n, freq_bins, device=bank_device, dtype=bank_dtype)
+        low_mask[:, :low_bins] = 1.0
+
+        energy_stats, peak_idx = self._spectral_statistics(amp, low_bins)
+        order_weights = torch.softmax(self.order_weight_mlp(desc_norm.mean(dim=-1)), dim=-1)
+        centers = peak_idx.float().unsqueeze(1) * self.harmonic_orders.unsqueeze(0)
+        centers = centers.clamp(max=freq_bins - 1)
+        freq_axis = torch.arange(freq_bins, device=bank_device, dtype=bank_dtype).view(1, 1, -1)
+        sigma = max(self.harmonic_sigma, 1e-3)
+        harmonic_masks = torch.exp(-0.5 * ((freq_axis - centers.unsqueeze(-1)) / sigma) ** 2)
+        harmonic_mask = (harmonic_masks * order_weights.unsqueeze(-1)).sum(dim=1)
+        harmonic_mask[:, :low_bins] = 0.0
+        harmonic_norm = harmonic_mask.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        harmonic_mask = harmonic_mask / harmonic_norm
+
+        residual_mask = torch.clamp(1.0 - torch.clamp(low_mask + harmonic_mask, max=1.0), min=0.0)
+        return [low_mask, harmonic_mask, residual_mask], energy_stats
+
+    def _complex_gate(self, freq, gate_mlp, gate_scale=0.2):
+        n, freq_bins, c = freq.shape
+        real = freq.real.view(n, freq_bins, self.groups, self.group_channels)
+        imag = freq.imag.view(n, freq_bins, self.groups, self.group_channels)
+        amp = torch.sqrt(real * real + imag * imag + 1e-6)
+        amp_norm = amp / amp.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+        phase_denom = amp.clamp_min(1e-6)
+        cos_phase = real / phase_denom
+        sin_phase = imag / phase_denom
+        gate_input = torch.cat([real, imag, amp_norm, cos_phase, sin_phase], dim=-1)
+        gate = torch.tanh(gate_mlp(gate_input))
+        gate = gate.view(n, freq_bins, self.groups, 2, self.group_channels)
+        gate_r = gate[:, :, :, 0, :] * gate_scale
+        gate_i = gate[:, :, :, 1, :] * gate_scale
+        out_real = real * (1.0 + gate_r) - imag * gate_i
+        out_imag = real * gate_i + imag * (1.0 + gate_r)
+        out_real = out_real.reshape(n, freq_bins, c)
+        out_imag = out_imag.reshape(n, freq_bins, c)
+        return torch.complex(out_real, out_imag)
+
+    def _route_banks(self, desc_norm, energy_stats):
+        router_input = torch.cat([desc_norm.mean(dim=-1), energy_stats], dim=-1)
+        weights = torch.softmax(self.router(router_input) / max(self.bank_temperature, 1e-6), dim=-1)
+        return weights
+
+    def _compute_delta(self, x, desc_norm, delta_1d):
+        delta = delta_1d
         if self.fusion_gate is not None:
-            delta = delta * torch.sigmoid(self.fusion_gate(desc))
+            delta = delta * torch.sigmoid(self.fusion_gate(desc_norm))
+        delta = self.res_scale * delta
+        delta = self.delta_proj(delta)
+        delta = delta.unsqueeze(-1).unsqueeze(-1)
+        if self.spatial_gate is not None:
+            spatial_gate = self.spatial_gate(x.mean(dim=2)).unsqueeze(2)
+            delta = delta * spatial_gate
+        return delta
 
-        delta = delta.transpose(1, 2).unsqueeze(-1).unsqueeze(-1).contiguous()
-        return x + self.res_scale * delta
+    def forward(self, x):
+        """
+            x: [n, c, s, h, w]
+        """
+        n, c, s = x.size()[:3]
+        x_fp32 = x.float()
+        desc = x_fp32.mean(dim=(-1, -2))  # [n, c, s]
+        desc_norm = self.norm(desc.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+        local = self._compute_local(desc_norm)
+
+        tokens = desc_norm.transpose(1, 2).contiguous()
+        freq = torch.fft.rfft(tokens, dim=1, norm='ortho')
+        amp = torch.abs(freq)
+        freq_bins = amp.size(1)
+        low_bins = min(max(int(round(freq_bins * self.low_freq_ratio)), 1), freq_bins)
+
+        bank_masks, energy_stats = self._build_bank_masks(amp, desc_norm, low_bins)
+        bank_outputs = []
+        for idx, (mask, gate_mlp, proj, gate_scale) in enumerate(zip(
+                bank_masks, self.bank_gate_mlps, self.bank_proj, self.bank_scales)):
+            bank_freq = freq * mask.unsqueeze(-1)
+            bank_freq = self._complex_gate(bank_freq, gate_mlp, gate_scale=gate_scale)
+            bank_time = torch.fft.irfft(bank_freq, n=s, dim=1, norm='ortho').transpose(1, 2).contiguous()
+            bank_outputs.append(proj(bank_time))
+
+        bank_stack = torch.stack(bank_outputs, dim=1)  # [n, bank, c, s]
+        bank_weights = self._route_banks(desc_norm, energy_stats)
+        fused_bank = (bank_stack * bank_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        bank_gap = self.bank_proj[-1](fused_bank - bank_outputs[0])
+        delta = self.bank_fuse(torch.cat([desc_norm, local, fused_bank, bank_gap], dim=1))
+        delta = self._compute_delta(x_fp32, desc_norm, delta)
+        return x + delta.to(dtype=x.dtype)
+
+
+class PeriodicTemporalStateAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        groups=1,
+        bottleneck_ratio=0.25,
+        fusion='gated_residual',
+        local_kernel_sizes=(3, 5, 7),
+        init_scale=0.05,
+        use_spatial_gate=True,
+        low_freq_ratio=0.20,
+        router_temperature=1.0,
+        **kwargs,
+    ):
+        super().__init__()
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        if fusion not in ['residual', 'gated_residual']:
+            raise ValueError("fusion must be 'residual' or 'gated_residual'")
+        if kwargs:
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("PeriodicTemporalStateAdapter ignores unused config keys: {}".format(ignored))
+
+        self.channels = channels
+        self.groups = groups
+        self.fusion = fusion
+        self.low_freq_ratio = float(low_freq_ratio)
+        self.router_temperature = float(router_temperature)
+
+        hidden_dim = max(int(channels * bottleneck_ratio), 16)
+        router_hidden = max(channels // 4, 32)
+        kernel_sizes = local_kernel_sizes if is_list_or_tuple(local_kernel_sizes) else [local_kernel_sizes]
+
+        self.norm = nn.LayerNorm(channels)
+        self.motion_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(
+                    channels * 3,
+                    channels,
+                    kernel_size=int(kernel_size),
+                    padding=int(kernel_size) // 2,
+                    groups=groups,
+                    bias=False,
+                ),
+                nn.BatchNorm1d(channels),
+                nn.GELU(),
+            )
+            for kernel_size in kernel_sizes
+        ])
+        self.motion_fuse = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.phase_gate = nn.Sequential(
+            nn.Conv1d(3, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, channels, kernel_size=1, bias=True),
+        )
+        self.phase_out_proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.memory_gate = nn.Sequential(
+            nn.Conv1d(channels * 2, channels, kernel_size=1, groups=groups, bias=True),
+            nn.Sigmoid(),
+        )
+        self.memory_out_proj = nn.Sequential(
+            nn.Conv1d(channels * 3, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+        )
+        self.router = nn.Sequential(
+            nn.Linear(channels + 5, router_hidden),
+            nn.GELU(),
+            nn.Linear(router_hidden, 3),
+        )
+        self.branch_out_proj = nn.Sequential(
+            nn.Conv1d(channels * 4, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+        )
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1), float(init_scale)))
+        self.fusion_gate = nn.Conv1d(channels, channels, kernel_size=1, bias=True) \
+            if fusion == 'gated_residual' else None
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid(),
+        ) if use_spatial_gate else None
+
+    def _temporal_diff(self, desc_norm, order):
+        if desc_norm.size(-1) <= order:
+            return torch.zeros_like(desc_norm)
+        diff = desc_norm[:, :, order:] - desc_norm[:, :, :-order]
+        return F.pad(diff, (order, 0))
+
+    def _compute_motion(self, desc_norm):
+        diff1 = self._temporal_diff(desc_norm, 1)
+        diff2 = self._temporal_diff(desc_norm, 2)
+        motion_input = torch.cat([desc_norm, diff1, diff2], dim=1)
+        motion = 0.0
+        for branch in self.motion_branches:
+            motion = motion + branch(motion_input)
+        motion = self.motion_fuse(motion / len(self.motion_branches))
+        return motion, diff1, diff2
+
+    def _estimate_cycle(self, desc_norm):
+        n, c, s = desc_norm.shape
+        phase_cos = desc_norm.new_ones(n, 1, s)
+        phase_sin = desc_norm.new_zeros(n, 1, s)
+        cycle_conf = desc_norm.new_zeros(n, 1)
+        peak_norm = desc_norm.new_zeros(n, 1)
+
+        tokens = desc_norm.transpose(1, 2).contiguous()
+        freq = torch.fft.rfft(tokens, dim=1, norm='ortho')
+        freq_energy = torch.abs(freq).mean(dim=-1)
+        freq_bins = freq_energy.size(1)
+        if freq_bins <= 1:
+            return phase_cos, phase_sin, cycle_conf, peak_norm
+
+        low_bins = min(max(int(round(freq_bins * self.low_freq_ratio)), 1), freq_bins - 1)
+        high_energy = freq_energy[:, low_bins:]
+        peak_rel = high_energy.argmax(dim=-1)
+        peak_idx = peak_rel + low_bins
+        peak_val = high_energy.gather(1, peak_rel.unsqueeze(-1))
+        cycle_conf = peak_val / high_energy.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        peak_norm = peak_idx.to(dtype=desc_norm.dtype).unsqueeze(-1) / float(freq_bins - 1)
+
+        mean_freq = freq.mean(dim=-1)
+        dom_coeff = mean_freq.gather(1, peak_idx.unsqueeze(-1)).squeeze(-1)
+        dom_phase = torch.angle(dom_coeff)
+        time_axis = torch.arange(s, device=desc_norm.device, dtype=desc_norm.dtype).view(1, s)
+        angular = (2.0 * math.pi / max(s, 1)) * peak_idx.to(dtype=desc_norm.dtype).unsqueeze(-1)
+        phase_cos = torch.cos(angular * time_axis + dom_phase.unsqueeze(-1)).unsqueeze(1)
+        phase_sin = torch.sin(angular * time_axis + dom_phase.unsqueeze(-1)).unsqueeze(1)
+        return phase_cos, phase_sin, cycle_conf, peak_norm
+
+    def _compute_phase_branch(self, desc_norm):
+        n, _, s = desc_norm.shape
+        phase_cos, phase_sin, cycle_conf, peak_norm = self._estimate_cycle(desc_norm)
+        cycle_token = cycle_conf.unsqueeze(-1).expand(n, 1, s)
+        phase_features = torch.cat([phase_cos, phase_sin, cycle_token], dim=1)
+        phase_gate = torch.sigmoid(self.phase_gate(phase_features))
+        phase = self.phase_out_proj(desc_norm * phase_gate)
+        return phase, cycle_conf, peak_norm
+
+    def _run_bidirectional_memory(self, desc_norm, gate):
+        n, c, s = desc_norm.shape
+        forward = torch.zeros_like(desc_norm)
+        backward = torch.zeros_like(desc_norm)
+
+        state = desc_norm[:, :, 0]
+        forward[:, :, 0] = state
+        for idx in range(1, s):
+            alpha = gate[:, :, idx]
+            state = alpha * state + (1.0 - alpha) * desc_norm[:, :, idx]
+            forward[:, :, idx] = state
+
+        state = desc_norm[:, :, -1]
+        backward[:, :, -1] = state
+        for idx in range(s - 2, -1, -1):
+            alpha = gate[:, :, idx]
+            state = alpha * state + (1.0 - alpha) * desc_norm[:, :, idx]
+            backward[:, :, idx] = state
+        return forward, backward
+
+    def _compute_memory(self, desc_norm, diff1):
+        gate = self.memory_gate(torch.cat([desc_norm, diff1.abs()], dim=1))
+        forward, backward = self._run_bidirectional_memory(desc_norm, gate)
+        memory = self.memory_out_proj(torch.cat([desc_norm, forward, backward], dim=1))
+        return memory
+
+    def _compute_delta(self, x, desc_norm, delta_1d):
+        delta = delta_1d
+        if self.fusion_gate is not None:
+            delta = delta * torch.sigmoid(self.fusion_gate(desc_norm))
+        delta = self.res_scale * delta
+        delta = delta.unsqueeze(-1).unsqueeze(-1)
+        if self.spatial_gate is not None:
+            spatial_gate = self.spatial_gate(x.mean(dim=2)).unsqueeze(2)
+            delta = delta * spatial_gate
+        return delta
+
+    def forward(self, x):
+        n, c, s = x.size()[:3]
+        x_fp32 = x.float()
+        desc = x_fp32.mean(dim=(-1, -2))
+        desc_norm = self.norm(desc.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+
+        motion, diff1, _ = self._compute_motion(desc_norm)
+        phase, cycle_conf, peak_norm = self._compute_phase_branch(desc_norm)
+        memory = self._compute_memory(desc_norm, diff1)
+
+        seq_std = desc_norm.std(dim=2, unbiased=False).mean(dim=1, keepdim=True)
+        diff_energy = diff1.abs().mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        motion_energy = motion.abs().mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        memory_energy = (memory - desc_norm).abs().mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        router_stats = torch.cat(
+            [seq_std, diff_energy, cycle_conf, peak_norm, memory_energy + motion_energy],
+            dim=-1,
+        )
+        router_input = torch.cat([desc_norm.mean(dim=-1), router_stats], dim=-1)
+        branch_weights = torch.softmax(
+            self.router(router_input) / max(self.router_temperature, 1e-6), dim=-1)
+
+        branch_stack = torch.stack([motion, phase, memory], dim=1)
+        fused = (branch_stack * branch_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        delta = self.branch_out_proj(
+            torch.cat([desc_norm, fused, motion - phase, memory - desc_norm], dim=1))
+        delta = self._compute_delta(x_fp32, desc_norm, delta)
+        return x + delta.to(dtype=x.dtype)
+
+
+class TemporalQualityGateAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        groups=1,
+        bottleneck_ratio=0.125,
+        fusion='gated_residual',
+        local_kernel_size=3,
+        init_scale=0.05,
+        init_gate_strength=0.5,
+        use_spatial_gate=True,
+        part_bins=4,
+        **kwargs,
+    ):
+        super().__init__()
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        if fusion not in ['residual', 'gated_residual']:
+            raise ValueError("fusion must be 'residual' or 'gated_residual'")
+
+        if 'local_kernel_sizes' in kwargs:
+            kernel_sizes = kwargs.pop('local_kernel_sizes')
+            if is_list_or_tuple(kernel_sizes):
+                local_kernel_size = int(kernel_sizes[len(kernel_sizes) // 2])
+            else:
+                local_kernel_size = int(kernel_sizes)
+        if kwargs:
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("TemporalQualityGateAdapter ignores unused config keys: {}".format(ignored))
+
+        self.channels = channels
+        self.groups = groups
+        self.fusion = fusion
+        self.part_bins = int(part_bins)
+        hidden_dim = max(int(channels * bottleneck_ratio), 16)
+
+        self.norm = nn.LayerNorm(channels)
+        self.temporal_context = nn.Sequential(
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=int(local_kernel_size),
+                padding=int(local_kernel_size) // 2,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+        self.frame_gate_mlp = nn.Sequential(
+            nn.Conv1d(channels * 2, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, 1, kernel_size=1, bias=True),
+        )
+        self.part_gate_mlp = nn.Sequential(
+            nn.Conv1d(channels, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, 1, kernel_size=1, bias=True),
+        ) if self.part_bins > 0 else None
+
+        self.frame_gate_strength = nn.Parameter(torch.tensor(float(init_gate_strength)))
+        self.part_gate_strength = nn.Parameter(torch.tensor(float(init_gate_strength)))
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1), float(init_scale)))
+        self.fusion_gate = nn.Conv1d(channels, channels, kernel_size=1, bias=True) \
+            if fusion == 'gated_residual' else None
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, groups=groups, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid(),
+        ) if use_spatial_gate else None
+
+        nn.init.zeros_(self.temporal_context[-1].weight)
+        nn.init.zeros_(self.temporal_context[-1].bias)
+        nn.init.zeros_(self.frame_gate_mlp[-1].weight)
+        nn.init.zeros_(self.frame_gate_mlp[-1].bias)
+        if self.part_gate_mlp is not None:
+            nn.init.zeros_(self.part_gate_mlp[-1].weight)
+            nn.init.zeros_(self.part_gate_mlp[-1].bias)
+
+    def _temporal_diff(self, desc_norm):
+        diff = desc_norm[:, :, 1:] - desc_norm[:, :, :-1]
+        return F.pad(diff, (1, 0))
+
+    def _build_gate_weight(self, gate_logits, strength, norm_dim):
+        gate = torch.sigmoid(gate_logits)
+        weight = 1.0 + torch.tanh(strength) * (gate - 0.5) * 2.0
+        return weight / weight.mean(dim=norm_dim, keepdim=True).clamp_min(1e-6)
+
+    def _compute_part_weight(self, x_fp32):
+        if self.part_gate_mlp is None:
+            return 1.0
+
+        n, _, s, h, _ = x_fp32.shape
+        part_desc = x_fp32.mean(dim=-1).permute(0, 2, 1, 3).reshape(n * s, self.channels, h)
+        part_desc = F.adaptive_avg_pool1d(part_desc, self.part_bins)
+        part_logits = self.part_gate_mlp(part_desc)
+        part_weight = self._build_gate_weight(part_logits, self.part_gate_strength, norm_dim=-1)
+        part_weight = F.interpolate(part_weight, size=h, mode='linear', align_corners=False)
+        part_weight = part_weight.view(n, s, 1, h).permute(0, 2, 1, 3).unsqueeze(-1)
+        return part_weight
+
+    def _compute_delta(self, x_fp32, desc_norm, temporal_delta):
+        delta = temporal_delta
+        if self.fusion_gate is not None:
+            delta = delta * torch.sigmoid(self.fusion_gate(desc_norm))
+        delta = self.res_scale * delta
+        delta = delta.unsqueeze(-1).unsqueeze(-1)
+        if self.spatial_gate is not None:
+            spatial_gate = self.spatial_gate(x_fp32.mean(dim=2)).unsqueeze(2)
+            delta = delta * spatial_gate
+        return delta
+
+    def forward(self, x):
+        x_fp32 = x.float()
+        desc = x_fp32.mean(dim=(-1, -2))
+        desc_norm = self.norm(desc.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+        diff = self._temporal_diff(desc_norm).abs()
+
+        frame_logits = self.frame_gate_mlp(torch.cat([desc_norm, diff], dim=1))
+        frame_weight = self._build_gate_weight(frame_logits, self.frame_gate_strength, norm_dim=2)
+        frame_weight = frame_weight.unsqueeze(-1).unsqueeze(-1)
+        part_weight = self._compute_part_weight(x_fp32)
+
+        temporal_input = desc_norm + 0.5 * diff
+        temporal_delta = self.temporal_context(temporal_input)
+        temporal_delta = self._compute_delta(x_fp32, desc_norm, temporal_delta)
+        gated = x_fp32 * frame_weight
+        if not isinstance(part_weight, float):
+            gated = gated * part_weight
+        return (gated + temporal_delta).to(dtype=x.dtype)
+
+
+class LaStGaitAdapter(nn.Module):
+    def __init__(
+        self,
+        channels,
+        part_bins=4,
+        topk_ratio=0.35,
+        min_topk=1,
+        gaussian_sigma=0.25,
+        gate_strength=0.25,
+        init_scale=0.02,
+        min_gate=0.75,
+        max_gate=1.25,
+        use_delta=True,
+        **kwargs,
+    ):
+        super().__init__()
+        if int(part_bins) <= 0:
+            raise ValueError("part_bins must be positive")
+        if kwargs:
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("LaStGaitAdapter ignores unused config keys: {}".format(ignored))
+
+        self.channels = channels
+        self.part_bins = int(part_bins)
+        self.topk_ratio = float(topk_ratio)
+        self.min_topk = int(min_topk)
+        self.gaussian_sigma = float(gaussian_sigma)
+        self.min_gate = float(min_gate)
+        self.max_gate = float(max_gate)
+        self.use_delta = use_delta
+        self.eps = 1e-6
+
+        self.gate_strength = nn.Parameter(torch.tensor(float(gate_strength)))
+        self.res_scale = nn.Parameter(torch.full((1, channels, 1, 1, 1), float(init_scale)))
+
+    def _channel_low_pass(self, tokens):
+        n, token_num, channels = tokens.shape
+        freq = torch.fft.rfft(tokens.float(), dim=-1, norm='ortho')
+        freq_bins = freq.size(-1)
+        freq_axis = torch.linspace(0, 1, freq_bins, device=tokens.device, dtype=tokens.float().dtype)
+        sigma = max(self.gaussian_sigma, 1e-4)
+        mask = torch.exp(-0.5 * (freq_axis / sigma) ** 2)
+        low = torch.fft.irfft(freq * mask.view(1, 1, -1), n=channels, dim=-1, norm='ortho')
+        return low
+
+    def _part_tokens(self, x_fp32):
+        n, c, s, h, _ = x_fp32.shape
+        part_feat = x_fp32.mean(dim=-1).permute(0, 2, 1, 3).reshape(n * s, c, h)
+        part_feat = F.adaptive_avg_pool1d(part_feat, self.part_bins)
+        tokens = part_feat.view(n, s, c, self.part_bins).permute(0, 1, 3, 2).contiguous()
+        return tokens.view(n, s * self.part_bins, c), s, h
+
+    def _stability_vote(self, tokens):
+        low = self._channel_low_pass(tokens)
+        stability = low.abs() / (low.sub(tokens.float()).abs() + self.eps)
+        token_num = tokens.size(1)
+        topk = min(max(int(round(token_num * self.topk_ratio)), self.min_topk), token_num)
+        topk_idx = stability.topk(topk, dim=1).indices
+        selected = stability.new_zeros(stability.shape)
+        selected.scatter_(1, topk_idx, 1.0)
+        vote = selected.mean(dim=-1)
+        vote = vote / vote.mean(dim=1, keepdim=True).clamp_min(self.eps)
+        gate = 1.0 + torch.tanh(self.gate_strength) * (vote - 1.0)
+        return gate.clamp(min=self.min_gate, max=self.max_gate), low
+
+    def _expand_part_map(self, part_map, seq_len, height):
+        n = part_map.size(0)
+        part_map = part_map.view(n, seq_len, self.part_bins).permute(0, 2, 1).unsqueeze(1)
+        part_map = F.interpolate(part_map, size=(height, seq_len), mode='bilinear', align_corners=False)
+        return part_map.permute(0, 1, 3, 2).unsqueeze(-1).contiguous()
+
+    def forward(self, x):
+        x_fp32 = x.float()
+        tokens, seq_len, height = self._part_tokens(x_fp32)
+        token_gate, low_tokens = self._stability_vote(tokens)
+        gate = self._expand_part_map(token_gate, seq_len, height)
+        out = x_fp32 * gate
+
+        if self.use_delta:
+            delta = low_tokens.sub(tokens.float())
+            delta = delta.view(x.size(0), seq_len, self.part_bins, self.channels)
+            delta = delta.permute(0, 3, 2, 1).contiguous()
+            delta = F.interpolate(delta, size=(height, seq_len), mode='bilinear', align_corners=False)
+            delta = delta.permute(0, 1, 3, 2).unsqueeze(-1).contiguous()
+            out = out + self.res_scale * delta
+        return out.to(dtype=x.dtype)
+
+
+class LaStTemporalPooling(nn.Module):
+    def __init__(
+        self,
+        topk_ratio=0.35,
+        min_topk=1,
+        gaussian_sigma=0.25,
+        stable_fusion_weight=0.35,
+        learnable_fusion=True,
+        **kwargs,
+    ):
+        super().__init__()
+        if kwargs:
+            ignored = ', '.join(sorted(kwargs.keys()))
+            print("LaStTemporalPooling ignores unused config keys: {}".format(ignored))
+        self.topk_ratio = float(topk_ratio)
+        self.min_topk = int(min_topk)
+        self.gaussian_sigma = float(gaussian_sigma)
+        self.learnable_fusion = learnable_fusion
+        self.eps = 1e-6
+
+        stable_fusion_weight = min(max(float(stable_fusion_weight), 1e-4), 1.0 - 1e-4)
+        if learnable_fusion:
+            init_logit = math.log(stable_fusion_weight / (1.0 - stable_fusion_weight))
+            self.fusion_logit = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
+        else:
+            self.register_buffer('fusion_weight', torch.tensor(stable_fusion_weight, dtype=torch.float32))
+
+    def _channel_low_pass(self, tokens):
+        channels = tokens.size(-1)
+        freq = torch.fft.rfft(tokens.float(), dim=-1, norm='ortho')
+        freq_bins = freq.size(-1)
+        freq_axis = torch.linspace(0, 1, freq_bins, device=tokens.device, dtype=tokens.float().dtype)
+        sigma = max(self.gaussian_sigma, 1e-4)
+        mask = torch.exp(-0.5 * (freq_axis / sigma) ** 2)
+        return torch.fft.irfft(freq * mask.view(*([1] * (freq.ndim - 1)), -1), n=channels, dim=-1, norm='ortho')
+
+    def _stable_weight(self):
+        if self.learnable_fusion:
+            return torch.sigmoid(self.fusion_logit)
+        return self.fusion_weight
+
+    def _pool_dim2(self, x):
+        n, c, s, h, w = x.shape
+        tokens = x.permute(0, 2, 3, 4, 1).contiguous()
+        low = self._channel_low_pass(tokens)
+        stability = low.abs() / (low.sub(tokens.float()).abs() + self.eps)
+        score = stability.permute(0, 4, 1, 2, 3).contiguous()
+        topk = min(max(int(round(s * self.topk_ratio)), self.min_topk), s)
+        indices = score.topk(topk, dim=2).indices
+        stable_pool = x.gather(2, indices).mean(dim=2)
+        max_pool = x.max(dim=2)[0]
+        alpha = self._stable_weight().to(device=x.device, dtype=x.dtype)
+        return alpha * stable_pool + (1.0 - alpha) * max_pool
+
+    def forward(self, seqs, seqL=None, dim=2, options={}):
+        if options and 'dim' in options:
+            dim = options['dim']
+        if dim != 2:
+            raise ValueError("LaStTemporalPooling only supports temporal dim=2 for [n, c, s, h, w] tensors.")
+
+        if seqL is None:
+            return [self._pool_dim2(seqs)]
+
+        seqL = seqL[0].data.cpu().numpy().tolist()
+        start = [0] + np.cumsum(seqL).tolist()[:-1]
+        pooled = []
+        for curr_start, curr_seqL in zip(start, seqL):
+            narrowed_seq = seqs.narrow(dim, curr_start, curr_seqL)
+            pooled.append(self._pool_dim2(narrowed_seq))
+        return [torch.cat(pooled)]
 
 
 class SeparateFCs(nn.Module):

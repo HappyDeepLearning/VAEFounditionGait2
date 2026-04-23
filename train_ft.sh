@@ -1,37 +1,34 @@
-# # **************** For CASIA-B ****************
-# # Baseline
-# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/baseline/baseline.yaml --phase train
+#!/usr/bin/env bash
 
-CUDA_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 python -m torch.distributed.launch \
-        --nproc_per_node=8 --master_port=9381  opengait/main.py \
-        --cfgs ./configs/deepgaitv2/DeepGaitV2_gait3d_tsa_ft_head.yaml \
-        --phase train --log_to_file
+set -euo pipefail
 
-# # GaitSet
-# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/gaitset/gaitset.yaml --phase train
+GPUS="${CUDA_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}"
+NPROC="${NPROC_PER_NODE:-8}"
+MASTER_PORT="${MASTER_PORT:-9381}"
+STAGE="${STAGE:-head}"
+CFG_PATH="${CFG_PATH:-}"
 
-# # GaitPart
-# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/gaitpart/gaitpart.yaml --phase train
+if [ -z "${CFG_PATH}" ]; then
+    case "${STAGE}" in
+        head)
+            CFG_PATH="./configs/deepgaitv2/DeepGaitV2_gait3d_last_ft_head.yaml"
+            ;;
+        full)
+            CFG_PATH="./configs/deepgaitv2/DeepGaitV2_gait3d_last_ft_full.yaml"
+            ;;
+        *)
+            echo "Unsupported STAGE: ${STAGE}. Use head or full, or set CFG_PATH directly."
+            exit 1
+            ;;
+    esac
+fi
 
-# GaitGL
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gaitgl/gaitgl.yaml --phase train
+echo "Using config: ${CFG_PATH}"
+echo "CUDA_VISIBLE_DEVICES=${GPUS}"
+echo "NPROC_PER_NODE=${NPROC}"
+echo "MASTER_PORT=${MASTER_PORT}"
 
-# # GLN 
-# # Phase 1
-# CUDA_VISIBLE_DEVICES=2,5,6,7 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gln/gln_phase1.yaml --phase train
-# # Phase 2
-# CUDA_VISIBLE_DEVICES=2,5,6,7 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gln/gln_phase2.yaml --phase train
-
-
-# # **************** For OUMVLP ****************
-# # Baseline
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/baseline/baseline_OUMVLP.yaml --phase train
-
-# # GaitSet
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitset/gaitset_OUMVLP.yaml --phase train
-
-# # GaitPart
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitpart/gaitpart_OUMVLP.yaml --phase train
-
-# GaitGL
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitgl/gaitgl_OUMVLP.yaml --phase train
+CUDA_VISIBLE_DEVICES="${GPUS}" python -m torch.distributed.launch \
+    --nproc_per_node="${NPROC}" --master_port="${MASTER_PORT}" opengait/main.py \
+    --cfgs "${CFG_PATH}" \
+    --phase train --log_to_file

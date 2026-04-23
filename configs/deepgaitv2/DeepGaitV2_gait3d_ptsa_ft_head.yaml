@@ -9,8 +9,8 @@ data_cfg:
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
-  restore_hint: 10000
-  save_name: DeepGaitV2_TSA_Gait3D_FT_HEAD
+  restore_hint: 12000
+  save_name: DeepGaitV2_PTSA_Gait3D_FT_HEAD
   eval_func: evaluate_Gait3D
   sampler:
     batch_shuffle: false
@@ -38,19 +38,18 @@ model_cfg:
     mode: adapter_head
   TemporalSpectralAdapter:
     enable: true
+    adapter_type: periodic_temporal_state
     groups: 1
-    bottleneck_ratio: 0.5
+    bottleneck_ratio: 0.25
     fusion: gated_residual
-    spectral_mode: amplitude_phase
     local_kernel_sizes:
       - 3
       - 5
       - 7
-    init_scale: 0.1
+    init_scale: 0.05
     use_spatial_gate: true
-    part_bins: 4
-    low_freq_ratio: 0.25
-    dynamic_only: true
+    low_freq_ratio: 0.20
+    router_temperature: 0.75
   Backbone:
     in_channels: 1
     mode: p3d
@@ -92,7 +91,7 @@ trainer_cfg:
   scheduler_reset: true
   restore_hint: pretrained_weights/Gait3D/DeepGaitV2/DeepGaitV2/checkpoints/DeepGaitV2-60000.pt
   save_iter: 5000
-  save_name: DeepGaitV2_TSA_Gait3D_FT_HEAD
+  save_name: DeepGaitV2_PTSA_Gait3D_FT_HEAD
   sync_BN: false
   total_iter: 12000
   sampler:
