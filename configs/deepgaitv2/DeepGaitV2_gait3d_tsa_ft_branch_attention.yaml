@@ -9,8 +9,8 @@ data_cfg:
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
-  restore_hint: 10000
-  save_name: DeepGaitV2_TSA_Gait3D_FT_HEAD
+  restore_hint: 20000
+  save_name: DeepGaitV2_TSA_Gait3D_FT_BRANCH_ATTN
   eval_func: evaluate_Gait3D
   sampler:
     batch_shuffle: false
@@ -35,22 +35,28 @@ loss_cfg:
 model_cfg:
   model: DeepGaitV2
   Finetune:
-    mode: adapter_head
+    mode: full
   TemporalSpectralAdapter:
     enable: true
+    adapter_type: branch_attention_residual
     groups: 1
-    bottleneck_ratio: 0.5
+    bottleneck_ratio: 0.25
     fusion: gated_residual
     spectral_mode: amplitude_phase
     local_kernel_sizes:
       - 3
       - 5
-      - 7
     init_scale: 0.1
     use_spatial_gate: true
     part_bins: 4
     low_freq_ratio: 0.25
     dynamic_only: true
+    branch_sources:
+      - identity
+      - local
+      - dynamic
+      - dynamic_gap
+      - part
   Backbone:
     in_channels: 1
     mode: p3d
@@ -68,23 +74,23 @@ model_cfg:
     class_num: 3000
 
 optimizer_cfg:
-  lr: 0.0015
-  backbone_lr: 0.0
+  lr: 0.001
+  backbone_lr: 0.0002
   head_lr: 0.001
-  adapter_lr: 0.0025
+  adapter_lr: 0.002
   momentum: 0.9
   solver: SGD
-  weight_decay: 0.0001
+  weight_decay: 0.0005
 
 scheduler_cfg:
   scheduler: CosineAnnealingLR
-  T_max: 12000
+  T_max: 30000
   eta_min: 1.0e-05
 
 trainer_cfg:
   find_unused_parameters: false
   enable_float16: true
-  fix_BN: true
+  fix_BN: false
   with_test: true
   log_iter: 100
   restore_ckpt_strict: false
@@ -92,9 +98,9 @@ trainer_cfg:
   scheduler_reset: true
   restore_hint: pretrained_weights/Gait3D/DeepGaitV2/DeepGaitV2/checkpoints/DeepGaitV2-60000.pt
   save_iter: 5000
-  save_name: DeepGaitV2_TSA_Gait3D_FT_HEAD
-  sync_BN: false
-  total_iter: 12000
+  save_name: DeepGaitV2_TSA_Gait3D_FT_BRANCH_ATTN
+  sync_BN: true
+  total_iter: 30000
   sampler:
     batch_shuffle: true
     batch_size:

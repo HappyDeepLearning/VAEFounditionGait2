@@ -3,7 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from ..base_model import BaseModel
-from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, SetBlockWrapper, TemporalSpectralAdapter, conv3x3, conv1x1, BasicBlock2D, BasicBlockP3D
+from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, SetBlockWrapper, TemporalSpectralAdapter, AdaptiveHarmonicResonanceAdapter, ComplexHarmonicFilterBankAdapter, conv3x3, conv1x1, BasicBlock2D, BasicBlockP3D
 
 from einops import rearrange
 
@@ -46,10 +46,22 @@ class SkeletonGaitPP(BaseModel):
        if adapter_cfg.get('enable', False):
            adapter_cfg = dict(adapter_cfg)
            adapter_cfg.pop('enable')
-           self.temporal_adapter = TemporalSpectralAdapter(
-               channels=256 * C,
-               **adapter_cfg,
-           )
+           adapter_type = adapter_cfg.pop('adapter_type', 'branch_attention_residual')
+           if adapter_type == 'adaptive_harmonic_resonance':
+               self.temporal_adapter = AdaptiveHarmonicResonanceAdapter(
+                   channels=256 * C,
+                   **adapter_cfg,
+               )
+           elif adapter_type in ['complex_harmonic_filter_bank', 'chfb']:
+               self.temporal_adapter = ComplexHarmonicFilterBankAdapter(
+                   channels=256 * C,
+                   **adapter_cfg,
+               )
+           else:
+               self.temporal_adapter = TemporalSpectralAdapter(
+                   channels=256 * C,
+                   **adapter_cfg,
+               )
        else:
            self.temporal_adapter = None
 

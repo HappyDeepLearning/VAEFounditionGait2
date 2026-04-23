@@ -8,7 +8,7 @@ import os.path as osp
 import matplotlib.pyplot as plt
 
 from ..base_model import BaseModel
-from ..modules import SetBlockWrapper, HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, TemporalSpectralAdapter, conv1x1, conv3x3, BasicBlock2D, BasicBlockP3D, BasicBlock3D
+from ..modules import SetBlockWrapper, HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, TemporalSpectralAdapter, AdaptiveHarmonicResonanceAdapter, ComplexHarmonicFilterBankAdapter, PeriodicTemporalStateAdapter, TemporalQualityGateAdapter, LaStGaitAdapter, LaStTemporalPooling, conv1x1, conv3x3, BasicBlock2D, BasicBlockP3D, BasicBlock3D
 from utils import get_valid_args, get_attr_from
 
 from einops import rearrange
@@ -66,16 +66,49 @@ class DeepGaitV2(BaseModel):
         self.FCs = SeparateFCs(16, channels[3], channels[2])
         self.BNNecks = SeparateBNNecks(16, channels[2], class_num=model_cfg['SeparateBNNecks']['class_num'])
 
-        self.TP = PackSequenceWrapper(torch.max)
+        pooling_cfg = dict(model_cfg.get('TemporalPooling', {}))
+        pooling_enable = pooling_cfg.pop('enable', False)
+        pooling_type = pooling_cfg.pop('type', 'max')
+        if pooling_enable and pooling_type in ['last', 'last_temporal', 'frequency_stable']:
+            self.TP = LaStTemporalPooling(**pooling_cfg)
+        else:
+            self.TP = PackSequenceWrapper(torch.max)
         self.HPP = HorizontalPoolingPyramid(bin_num=[16])
         adapter_cfg = model_cfg.get('TemporalSpectralAdapter', {})
         if adapter_cfg.get('enable', False):
             adapter_cfg = dict(adapter_cfg)
             adapter_cfg.pop('enable')
-            self.temporal_adapter = TemporalSpectralAdapter(
-                channels=channels[3],
-                **adapter_cfg,
-            )
+            adapter_type = adapter_cfg.pop('adapter_type', 'branch_attention_residual')
+            if adapter_type == 'adaptive_harmonic_resonance':
+                self.temporal_adapter = AdaptiveHarmonicResonanceAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
+            elif adapter_type in ['complex_harmonic_filter_bank', 'chfb']:
+                self.temporal_adapter = ComplexHarmonicFilterBankAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
+            elif adapter_type in ['periodic_temporal_state', 'ptsa']:
+                self.temporal_adapter = PeriodicTemporalStateAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
+            elif adapter_type in ['temporal_quality_gate', 'tqg']:
+                self.temporal_adapter = TemporalQualityGateAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
+            elif adapter_type in ['last_gait', 'last', 'lazystrike']:
+                self.temporal_adapter = LaStGaitAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
+            else:
+                self.temporal_adapter = TemporalSpectralAdapter(
+                    channels=channels[3],
+                    **adapter_cfg,
+                )
         else:
             self.temporal_adapter = None
         self.finetune_cfg = model_cfg.get('Finetune', {})
@@ -83,7 +116,8 @@ class DeepGaitV2(BaseModel):
 
     def configure_finetune(self):
         mode = self.finetune_cfg.get('mode', 'full')
-        if mode == 'full':
+        extra_trainable_modules = self.finetune_cfg.get('extra_trainable_modules', [])
+        if mode in ['full', 'full_finetune']:
             for param in self.parameters():
                 param.requires_grad = True
         elif mode == 'adapter_head':
@@ -92,11 +126,20 @@ class DeepGaitV2(BaseModel):
             if self.temporal_adapter is not None:
                 for param in self.temporal_adapter.parameters():
                     param.requires_grad = True
+            for param in self.TP.parameters():
+                param.requires_grad = True
             for module in [self.FCs, self.BNNecks]:
                 for param in module.parameters():
                     param.requires_grad = True
         else:
             raise ValueError("Unsupported Finetune.mode: {}".format(mode))
+
+        for module_name in extra_trainable_modules:
+            module = getattr(self, module_name, None)
+            if module is None:
+                raise ValueError("Unknown module in Finetune.extra_trainable_modules: {}".format(module_name))
+            for param in module.parameters():
+                param.requires_grad = True
 
     def get_optimizer(self, optimizer_cfg):
         self.msg_mgr.log_info(optimizer_cfg)
@@ -119,9 +162,10 @@ class DeepGaitV2(BaseModel):
         backbone_params = [p for module in backbone_modules for p in module.parameters() if p.requires_grad]
         head_params = [p for module in [self.FCs, self.BNNecks] for p in module.parameters() if p.requires_grad]
         adapter_params = list(self.temporal_adapter.parameters()) if self.temporal_adapter is not None else []
+        adapter_params += list(self.TP.parameters())
         adapter_params = [p for p in adapter_params if p.requires_grad]
 
-        if mode == 'full' and backbone_params:
+        if mode in ['full', 'full_finetune'] and backbone_params:
             param_groups.append({'params': backbone_params, 'lr': backbone_lr, 'weight_decay': weight_decay})
         if head_params:
             param_groups.append({'params': head_params, 'lr': head_lr, 'weight_decay': weight_decay})

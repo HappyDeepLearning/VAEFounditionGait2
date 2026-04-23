@@ -39,9 +39,18 @@ model_cfg:
   TemporalSpectralAdapter:
     enable: true
     groups: 1
-    bottleneck_ratio: 0.25
-    fusion: residual
-    spectral_mode: amplitude
+    bottleneck_ratio: 0.5
+    fusion: gated_residual
+    spectral_mode: amplitude_phase
+    local_kernel_sizes:
+      - 3
+      - 5
+      - 7
+    init_scale: 0.1
+    use_spatial_gate: true
+    part_bins: 4
+    low_freq_ratio: 0.25
+    dynamic_only: true
   Backbone:
     in_channels: 1
     mode: p3d
@@ -60,19 +69,17 @@ model_cfg:
 
 optimizer_cfg:
   lr: 0.001
-  backbone_lr: 0.0005
+  backbone_lr: 0.0002
   head_lr: 0.001
-  adapter_lr: 0.001
+  adapter_lr: 0.002
   momentum: 0.9
   solver: SGD
   weight_decay: 0.0005
 
 scheduler_cfg:
-  gamma: 0.1
-  milestones:
-    - 10000
-    - 16000
-  scheduler: MultiStepLR
+  scheduler: CosineAnnealingLR
+  T_max: 30000
+  eta_min: 1.0e-05
 
 trainer_cfg:
   find_unused_parameters: false
@@ -87,7 +94,7 @@ trainer_cfg:
   save_iter: 5000
   save_name: DeepGaitV2_TSA_Gait3D_FT_FULL
   sync_BN: true
-  total_iter: 20000
+  total_iter: 30000
   sampler:
     batch_shuffle: true
     batch_size:

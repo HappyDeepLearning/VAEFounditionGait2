@@ -13,6 +13,7 @@ __pycache__/
 events.out.tfevents.*
 # cache
 *.pkl
+.DS_Store
 # C extensions
 *.so
 
